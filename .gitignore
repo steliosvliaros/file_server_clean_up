@@ -1,0 +1,15 @@
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Outputs (do not commit)
+outputs/
+quarantine/
