@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
+import re
+import stat
 import shutil
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,6 +58,17 @@ class EmptyFoldersCleanupResult:
     dry_run: bool
 
 
+@dataclass(slots=True)
+class NameNormalizationResult:
+    plan_csv_path: Path
+    reduction_csv_path: Path | None
+    scanned_items: int
+    planned_renames: int
+    renamed_items: int
+    failed_items: int
+    over_limit_after_basic_normalization: int
+
+
 def _safe_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
 
@@ -100,20 +114,639 @@ def _hash_file(path: Path, algorithm: str = "blake2b", chunk_size: int = 8 * 102
     return hasher.hexdigest()
 
 
+_DATE_TOKEN_PATTERN = re.compile(
+    r"(?<!\d)(\d{8}|\d{4}[.\-/ _]\d{1,2}[.\-/ _]\d{1,2}|\d{1,2}[.\-/ _]\d{1,2}[.\-/ _]\d{2,4})(?!\d)"
+)
+
+
+def _expand_two_digit_year(year_two_digits: int) -> int:
+    # Common pivot for YY -> YYYY conversion.
+    return 2000 + year_two_digits if year_two_digits <= 69 else 1900 + year_two_digits
+
+
+def _parse_date_token(token: str) -> str | None:
+    token = token.strip()
+    try:
+        if re.fullmatch(r"\d{8}", token):
+            # Prefer YYYYMMDD when plausible, otherwise fallback to DDMMYYYY.
+            y1, m1, d1 = int(token[0:4]), int(token[4:6]), int(token[6:8])
+            try:
+                return datetime(y1, m1, d1).strftime("%Y%m%d")
+            except ValueError:
+                d2, m2, y2 = int(token[0:2]), int(token[2:4]), int(token[4:8])
+                return datetime(y2, m2, d2).strftime("%Y%m%d")
+
+        if re.fullmatch(r"\d{4}[.\-/ _]\d{1,2}[.\-/ _]\d{1,2}", token):
+            year, month, day = re.split(r"[.\-/ _]", token)
+            return datetime(int(year), int(month), int(day)).strftime("%Y%m%d")
+
+        if re.fullmatch(r"\d{1,2}[.\-/ _]\d{1,2}[.\-/ _]\d{2,4}", token):
+            day, month, year = re.split(r"[.\-/ _]", token)
+            parsed_year = int(year)
+            if len(year) == 2:
+                parsed_year = _expand_two_digit_year(parsed_year)
+            return datetime(parsed_year, int(month), int(day)).strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+    return None
+
+
+def _normalize_dates_in_name(name: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        formatted = _parse_date_token(token)
+        if not formatted:
+            return " "
+        if match.start() == 0:
+            return f"{formatted}_"
+        if match.end() == len(name):
+            return f"_{formatted}"
+        return f"_{formatted}_"
+
+    return _DATE_TOKEN_PATTERN.sub(_replace, name)
+
+
+def _remove_special_characters(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    no_marks = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return "".join(ch if (ch.isalnum() or ch in {" ", "-", "_"}) else " " for ch in no_marks)
+
+
+def _sanitize_component_name(name: str, *, is_file: bool) -> str:
+    if is_file:
+        stem = Path(name).stem
+        extension = Path(name).suffix
+    else:
+        stem = name
+        extension = ""
+
+    stem = _normalize_dates_in_name(stem)
+    stem = _remove_special_characters(stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    stem = stem.replace(" ", "-")
+    stem = re.sub(r"_+", "_", stem)
+    stem = re.sub(r"-+", "-", stem)
+    stem = re.sub(r"(?:_-)|(?:-_)", "-", stem)
+    stem = stem.strip("_-")
+
+    if not stem:
+        stem = "item"
+
+    if not is_file:
+        return stem
+
+    ext_clean = extension.lower().strip()
+    if ext_clean and not ext_clean.startswith("."):
+        ext_clean = f".{ext_clean}"
+
+    return f"{stem}{ext_clean}"
+
+
+def _shorten_name_with_hash(name: str, *, is_file: bool, max_name_chars: int) -> str:
+    if len(name) <= max_name_chars:
+        return name
+
+    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=4).hexdigest()
+
+    if not is_file:
+        keep = max(1, max_name_chars - 9)
+        return f"{name[:keep]}_{digest}"[:max_name_chars]
+
+    stem = Path(name).stem
+    ext = Path(name).suffix.lower()
+    budget_for_stem = max(1, max_name_chars - len(ext) - 9)
+    short_stem = stem[:budget_for_stem]
+    candidate = f"{short_stem}_{digest}{ext}"
+    if len(candidate) <= max_name_chars:
+        return candidate
+    # Last resort: trim extension if the original extension is unusually long.
+    return candidate[:max_name_chars]
+
+
+def _build_unique_target_name(parent: Path, desired_name: str) -> Path:
+    candidate = parent / desired_name
+    if not candidate.exists():
+        return candidate
+
+    if candidate.is_dir():
+        base_name = desired_name
+        suffix = ""
+    else:
+        base_name = Path(desired_name).stem
+        suffix = Path(desired_name).suffix
+
+    counter = 2
+    while True:
+        next_name = f"{base_name}-{counter:02d}{suffix}"
+        candidate = parent / next_name
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _is_reparse_or_link_dir(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        st = path.lstat()
+        if hasattr(st, "st_file_attributes"):
+            return bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return True
+    return False
+
+
+def _fit_name_to_max_path(
+    *,
+    parent: Path,
+    desired_name: str,
+    is_file: bool,
+    max_safe_path_chars: int,
+) -> tuple[str, Path, int, bool, bool]:
+    proposed_path = parent / desired_name
+    proposed_len = len(str(proposed_path))
+    if proposed_len <= max_safe_path_chars:
+        return desired_name, proposed_path, proposed_len, False, True
+
+    allowed_name_len = max_safe_path_chars - len(str(parent)) - 1
+    if allowed_name_len < 1:
+        forced_name = "x"
+        if is_file:
+            ext = Path(desired_name).suffix.lower()
+            if ext and len(ext) < max_safe_path_chars:
+                forced_name = f"x{ext}"
+        forced_path = parent / forced_name
+        return forced_name, forced_path, len(str(forced_path)), forced_name != desired_name, False
+
+    fitted_name = _shorten_name_with_hash(
+        desired_name,
+        is_file=is_file,
+        max_name_chars=allowed_name_len,
+    )
+    if len(fitted_name) > allowed_name_len:
+        fitted_name = fitted_name[:allowed_name_len]
+
+    fitted_path = parent / fitted_name
+    fitted_len = len(str(fitted_path))
+    if fitted_len <= max_safe_path_chars:
+        return fitted_name, fitted_path, fitted_len, fitted_name != desired_name, True
+
+    # Final aggressive fallback trimming by single characters.
+    if is_file:
+        ext = Path(fitted_name).suffix.lower()
+        stem = Path(fitted_name).stem
+        candidate_name = f"{stem}{ext}"
+        while stem and len(str(parent / candidate_name)) > max_safe_path_chars:
+            stem = stem[:-1]
+            candidate_name = f"{stem or 'x'}{ext}"
+    else:
+        stem = fitted_name
+        while stem and len(str(parent / stem)) > max_safe_path_chars:
+            stem = stem[:-1]
+        candidate_name = stem or "x"
+
+    candidate_path = parent / candidate_name
+    candidate_len = len(str(candidate_path))
+    return candidate_name, candidate_path, candidate_len, candidate_name != desired_name, candidate_len <= max_safe_path_chars
+
+
+def normalize_names_and_export_reduction_csv(
+    root_path: str | Path,
+    output_plan_csv_path: str | Path,
+    *,
+    max_safe_path_chars: int = 240,
+    dry_run: bool = True,
+    dry_run_minimal_csv: bool = True,
+    write_reduction_csv: bool = True,
+    skip_hidden_dirs: bool = False,
+    skip_underscore_dirs: bool = True,
+    skip_reparse_dirs: bool = True,
+    reduction_csv_path: str | Path | None = None,
+) -> NameNormalizationResult:
+    root = Path(root_path)
+    plan_csv = Path(output_plan_csv_path)
+
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Invalid root path: {root}")
+    if max_safe_path_chars < 1:
+        raise ValueError("max_safe_path_chars must be >= 1")
+
+    reduction_csv: Path | None
+    if write_reduction_csv:
+        if reduction_csv_path is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            reduction_csv = plan_csv.with_name(f"name_reduction_proposals_{ts}.csv")
+        else:
+            reduction_csv = Path(reduction_csv_path)
+    else:
+        reduction_csv = None
+
+    plan_csv.parent.mkdir(parents=True, exist_ok=True)
+    if reduction_csv is not None:
+        reduction_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict] = []
+    reduction_rows: list[dict] = []
+
+    scanned_items = 0
+    planned_renames = 0
+    renamed_items = 0
+    failed_items = 0
+    over_limit_after_basic_normalization = 0
+
+    if dry_run and dry_run_minimal_csv:
+        plan_columns = [
+            "item_type",
+            "current_path",
+            "current_name",
+            "proposed_name",
+            "proposed_path_final",
+            "path_char_count_initial",
+            "path_char_count_final",
+            "is_within_safe_limit",
+        ]
+        reduction_columns = [
+            "item_type",
+            "current_path",
+            "current_name",
+            "proposed_name",
+            "proposed_path",
+            "path_char_count_initial",
+            "path_char_count_final",
+            "is_over_safe_limit",
+        ]
+
+        with plan_csv.open("w", newline="", encoding="utf-8-sig") as plan_stream:
+            plan_writer = csv.DictWriter(plan_stream, fieldnames=plan_columns)
+            plan_writer.writeheader()
+
+            reduction_stream = None
+            reduction_writer = None
+            try:
+                if reduction_csv is not None:
+                    reduction_stream = reduction_csv.open("w", newline="", encoding="utf-8-sig")
+                    reduction_writer = csv.DictWriter(reduction_stream, fieldnames=reduction_columns)
+                    reduction_writer.writeheader()
+
+                for current_dir, dirs, files in os.walk(root, topdown=True):
+                    if skip_hidden_dirs:
+                        dirs[:] = [name for name in dirs if not name.startswith(".")]
+                    if skip_underscore_dirs:
+                        dirs[:] = [name for name in dirs if not name.startswith("_")]
+                    if skip_reparse_dirs:
+                        current_path_for_dirs = Path(current_dir)
+                        dirs[:] = [
+                            name
+                            for name in dirs
+                            if not _is_reparse_or_link_dir(current_path_for_dirs / name)
+                        ]
+
+                    current_path = Path(current_dir)
+
+                    for dir_name in dirs:
+                        scanned_items += 1
+                        source_dir_path = current_path / dir_name
+                        basic_name = _sanitize_component_name(dir_name, is_file=False)
+                        (
+                            proposed_name,
+                            proposed_path,
+                            proposed_len,
+                            _reduction_applied,
+                            fits_limit,
+                        ) = _fit_name_to_max_path(
+                            parent=current_path,
+                            desired_name=basic_name,
+                            is_file=False,
+                            max_safe_path_chars=max_safe_path_chars,
+                        )
+                        source_len = len(str(source_dir_path))
+                        if dir_name != proposed_name:
+                            planned_renames += 1
+
+                        plan_writer.writerow(
+                            {
+                                "item_type": "directory",
+                                "current_path": str(source_dir_path),
+                                "current_name": dir_name,
+                                "proposed_name": proposed_name,
+                                "proposed_path_final": str(proposed_path),
+                                "path_char_count_initial": source_len,
+                                "path_char_count_final": proposed_len,
+                                "is_within_safe_limit": fits_limit,
+                            }
+                        )
+
+                        if reduction_writer is not None and not fits_limit:
+                            over_limit_after_basic_normalization += 1
+                            reduction_writer.writerow(
+                                {
+                                    "item_type": "directory",
+                                    "current_path": str(source_dir_path),
+                                    "current_name": dir_name,
+                                    "proposed_name": proposed_name,
+                                    "proposed_path": str(proposed_path),
+                                    "path_char_count_initial": source_len,
+                                    "path_char_count_final": proposed_len,
+                                    "is_over_safe_limit": True,
+                                }
+                            )
+
+                    for file_name in files:
+                        scanned_items += 1
+                        basic_name = _sanitize_component_name(file_name, is_file=True)
+                        source_path = current_path / file_name
+                        (
+                            proposed_name,
+                            proposed_path,
+                            proposed_len,
+                            _reduction_applied,
+                            fits_limit,
+                        ) = _fit_name_to_max_path(
+                            parent=current_path,
+                            desired_name=basic_name,
+                            is_file=True,
+                            max_safe_path_chars=max_safe_path_chars,
+                        )
+                        source_len = len(str(source_path))
+                        if file_name != proposed_name:
+                            planned_renames += 1
+
+                        plan_writer.writerow(
+                            {
+                                "item_type": "file",
+                                "current_path": str(source_path),
+                                "current_name": file_name,
+                                "proposed_name": proposed_name,
+                                "proposed_path_final": str(proposed_path),
+                                "path_char_count_initial": source_len,
+                                "path_char_count_final": proposed_len,
+                                "is_within_safe_limit": fits_limit,
+                            }
+                        )
+
+                        if reduction_writer is not None:
+                            if not fits_limit:
+                                over_limit_after_basic_normalization += 1
+                                reduction_writer.writerow(
+                                    {
+                                        "item_type": "file",
+                                        "current_path": str(source_path),
+                                        "current_name": file_name,
+                                        "proposed_name": proposed_name,
+                                        "proposed_path": str(proposed_path),
+                                        "path_char_count_initial": source_len,
+                                        "path_char_count_final": proposed_len,
+                                        "is_over_safe_limit": True,
+                                    }
+                                )
+            finally:
+                if reduction_stream is not None:
+                    reduction_stream.close()
+
+        LOGGER.info(
+            "Name normalization complete",
+            extra={
+                "root_path": str(root),
+                "plan_csv_path": str(plan_csv),
+                "reduction_csv_path": str(reduction_csv) if reduction_csv is not None else "",
+                "scanned_items": scanned_items,
+                "planned_renames": planned_renames,
+                "renamed_items": 0,
+                "failed_items": 0,
+                "over_limit_after_basic_normalization": over_limit_after_basic_normalization,
+                "write_reduction_csv": write_reduction_csv,
+                "dry_run": True,
+                "dry_run_minimal_csv": True,
+            },
+        )
+
+        return NameNormalizationResult(
+            plan_csv_path=plan_csv,
+            reduction_csv_path=reduction_csv,
+            scanned_items=scanned_items,
+            planned_renames=planned_renames,
+            renamed_items=0,
+            failed_items=0,
+            over_limit_after_basic_normalization=over_limit_after_basic_normalization,
+        )
+    else:
+        plan_columns = [
+            "item_type",
+            "current_path",
+            "current_name",
+            "proposed_name_basic",
+            "proposed_name_final",
+            "proposed_path_final",
+            "path_char_count_initial",
+            "path_char_count_final",
+            "is_over_safe_limit_after_basic",
+            "is_over_safe_limit_after_final",
+            "reduction_applied",
+            "needs_rename",
+            "status",
+        ]
+        reduction_columns = plan_columns
+
+        directories_to_process: list[Path] = []
+
+        for current_dir, dirs, files in os.walk(root, topdown=True):
+            if skip_hidden_dirs:
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+            if skip_underscore_dirs:
+                dirs[:] = [name for name in dirs if not name.startswith("_")]
+            if skip_reparse_dirs:
+                current_path_for_dirs = Path(current_dir)
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if not _is_reparse_or_link_dir(current_path_for_dirs / name)
+                ]
+
+            current_path = Path(current_dir)
+            directories_to_process.append(current_path)
+
+            for file_name in files:
+                file_path = current_path / file_name
+                try:
+                    if not file_path.is_file() or file_path.is_symlink():
+                        continue
+                except OSError:
+                    continue
+
+                scanned_items += 1
+                basic_name = _sanitize_component_name(file_name, is_file=True)
+                basic_target = current_path / basic_name
+                basic_target_len = len(str(basic_target))
+                over_limit_basic = basic_target_len > max_safe_path_chars
+                if over_limit_basic:
+                    over_limit_after_basic_normalization += 1
+
+                final_name, final_target, final_target_len, reduction_applied, fits_limit = _fit_name_to_max_path(
+                    parent=current_path,
+                    desired_name=basic_name,
+                    is_file=True,
+                    max_safe_path_chars=max_safe_path_chars,
+                )
+                over_limit_final = not fits_limit
+
+                needs_rename = file_name != final_name
+                if needs_rename:
+                    planned_renames += 1
+
+                status = "PLANNED"
+                if needs_rename and not dry_run:
+                    try:
+                        target = _build_unique_target_name(current_path, final_name)
+                        file_path.rename(target)
+                        final_target = target
+                        final_target_len = len(str(final_target))
+                        over_limit_final = final_target_len > max_safe_path_chars
+                        renamed_items += 1
+                        status = "RENAMED"
+                    except Exception as exc:
+                        failed_items += 1
+                        status = f"FAILED: {exc}"
+
+                row = {
+                    "item_type": "file",
+                    "current_path": str(file_path),
+                    "current_name": file_name,
+                    "proposed_name_basic": basic_name,
+                    "proposed_name_final": final_name,
+                    "proposed_path_final": str(final_target),
+                    "path_char_count_initial": len(str(file_path)),
+                    "is_over_safe_limit_after_basic": over_limit_basic,
+                    "is_over_safe_limit_after_final": over_limit_final,
+                    "reduction_applied": reduction_applied,
+                    "path_char_count_final": final_target_len,
+                    "needs_rename": needs_rename,
+                    "status": status,
+                }
+                rows.append(row)
+
+                if over_limit_basic:
+                    reduction_rows.append(row)
+
+        # Rename directories from deepest to shallowest so children are handled first.
+        for current_path in sorted(directories_to_process, key=lambda p: len(p.parts), reverse=True):
+            if current_path == root:
+                continue
+
+            scanned_items += 1
+            parent = current_path.parent
+            current_name = current_path.name
+            basic_name = _sanitize_component_name(current_name, is_file=False)
+            basic_target = parent / basic_name
+            basic_target_len = len(str(basic_target))
+            over_limit_basic = basic_target_len > max_safe_path_chars
+            if over_limit_basic:
+                over_limit_after_basic_normalization += 1
+
+            final_name, final_target, final_target_len, reduction_applied, fits_limit = _fit_name_to_max_path(
+                parent=parent,
+                desired_name=basic_name,
+                is_file=False,
+                max_safe_path_chars=max_safe_path_chars,
+            )
+            over_limit_final = not fits_limit
+
+            needs_rename = current_name != final_name
+            if needs_rename:
+                planned_renames += 1
+
+            status = "PLANNED"
+            if needs_rename and not dry_run:
+                try:
+                    target = _build_unique_target_name(parent, final_name)
+                    current_path.rename(target)
+                    final_target = target
+                    final_target_len = len(str(final_target))
+                    over_limit_final = final_target_len > max_safe_path_chars
+                    renamed_items += 1
+                    status = "RENAMED"
+                except Exception as exc:
+                    failed_items += 1
+                    status = f"FAILED: {exc}"
+
+            row = {
+                "item_type": "directory",
+                "current_path": str(current_path),
+                "current_name": current_name,
+                "proposed_name_basic": basic_name,
+                "proposed_name_final": final_name,
+                "proposed_path_final": str(final_target),
+                "path_char_count_initial": len(str(current_path)),
+                "is_over_safe_limit_after_basic": over_limit_basic,
+                "is_over_safe_limit_after_final": over_limit_final,
+                "reduction_applied": reduction_applied,
+                "path_char_count_final": final_target_len,
+                "needs_rename": needs_rename,
+                "status": status,
+            }
+            rows.append(row)
+
+            if over_limit_basic:
+                reduction_rows.append(row)
+
+    with plan_csv.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=plan_columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in plan_columns})
+
+    if reduction_csv is not None:
+        with reduction_csv.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.DictWriter(stream, fieldnames=reduction_columns)
+            writer.writeheader()
+            for row in reduction_rows:
+                writer.writerow({column: row.get(column, "") for column in reduction_columns})
+
+    LOGGER.info(
+        "Name normalization complete",
+        extra={
+            "root_path": str(root),
+            "plan_csv_path": str(plan_csv),
+            "reduction_csv_path": str(reduction_csv) if reduction_csv is not None else "",
+            "scanned_items": scanned_items,
+            "planned_renames": planned_renames,
+            "renamed_items": renamed_items,
+            "failed_items": failed_items,
+            "over_limit_after_basic_normalization": over_limit_after_basic_normalization,
+                "write_reduction_csv": write_reduction_csv,
+            "dry_run": dry_run,
+        },
+    )
+
+    return NameNormalizationResult(
+        plan_csv_path=plan_csv,
+        reduction_csv_path=reduction_csv,
+        scanned_items=scanned_items,
+        planned_renames=planned_renames,
+        renamed_items=renamed_items,
+        failed_items=failed_items,
+        over_limit_after_basic_normalization=over_limit_after_basic_normalization,
+    )
+
+
 def export_file_inventory_csv(
     root_path: str | Path,
     output_csv_path: str | Path,
     *,
     skip_hidden_dirs: bool = False,
+    skip_underscore_dirs: bool = True,
     hash_algorithm: str = "blake2b",
     compute_content_duplicates: bool = False,
     allowed_extensions: list[str] | set[str] | tuple[str, ...] | None = None,
+    max_safe_path_chars: int = 240,
 ) -> FileInventoryResult:
     root = Path(root_path)
     output_csv = Path(output_csv_path)
 
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Invalid root path: {root}")
+    if max_safe_path_chars < 1:
+        raise ValueError("max_safe_path_chars must be >= 1")
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +765,8 @@ def export_file_inventory_csv(
     for current_dir, dirs, files in os.walk(root):
         if skip_hidden_dirs:
             dirs[:] = [name for name in dirs if not name.startswith(".")]
+        if skip_underscore_dirs:
+            dirs[:] = [name for name in dirs if not name.startswith("_")]
 
         current = Path(current_dir)
 
@@ -146,6 +781,7 @@ def export_file_inventory_csv(
 
             records.append(
                 {
+                    "path_char_count": len(str(file_path)),
                     "file_name": file_path.stem,
                     "extension": file_path.suffix.lower(),
                     "path": str(file_path),
@@ -195,6 +831,10 @@ def export_file_inventory_csv(
         if not compute_content_duplicates:
             reasons.append("content_check_not_computed")
 
+        record["is_path_at_or_over_safe_limit"] = record["path_char_count"] >= max_safe_path_chars
+        if record["is_path_at_or_over_safe_limit"]:
+            reasons.append("path_at_or_over_safe_limit")
+
         extension = record["extension"]
         if normalized_allowed_extensions is None:
             record["is_extension_not_allowed"] = False
@@ -210,6 +850,8 @@ def export_file_inventory_csv(
         record["is_duplicate_content"] = is_dup_content
 
     columns = [
+        "path_char_count",
+        "is_path_at_or_over_safe_limit",
         "file_name",
         "extension",
         "path",
